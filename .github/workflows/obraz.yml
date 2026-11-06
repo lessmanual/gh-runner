@@ -1,0 +1,52 @@
+# Build, Trivy gate (HIGH/CRITICAL block) and publish to GHCR. Manual trigger, main branch only.
+# Consumers pin the image by the digest printed in the job summary.
+name: obraz
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  OBRAZ: ghcr.io/lessmanual/gh-runner
+  TRIVY_URL: https://github.com/aquasecurity/trivy/releases/download/v0.75.0/trivy_0.75.0_Linux-64bit.tar.gz
+  TRIVY_SHA256: c6e65abddb348e25f10549df887045629cf28cc72453cd1c63acb717316b3f3f
+
+jobs:
+  obraz:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: build linux/amd64
+        run: docker build --platform linux/amd64 -t gh-runner:local .
+      - name: Trivy gate, HIGH and CRITICAL block
+        run: |
+          set -euo pipefail
+          curl -fsSL -o "$RUNNER_TEMP/trivy.tar.gz" "$TRIVY_URL"
+          echo "$TRIVY_SHA256  $RUNNER_TEMP/trivy.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/trivy.tar.gz" -C "$RUNNER_TEMP" trivy
+          "$RUNNER_TEMP/trivy" image --scanners vuln --severity HIGH,CRITICAL --exit-code 1 gh-runner:local
+      - name: smoke, runner starts without docker and npm
+        run: |
+          set -euo pipefail
+          docker run --rm --entrypoint bash gh-runner:local -c '
+            cd /home/runner && ./bin/Runner.Listener --version | tail -1
+            for b in docker dockerd containerd runc ctr; do if command -v "$b"; then exit 1; fi; done
+            test ! -e externals/node20/lib/node_modules/npm'
+      - name: publish and digest
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "$TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker tag gh-runner:local "$OBRAZ:2.338.2-$GITHUB_RUN_NUMBER"
+          docker push "$OBRAZ:2.338.2-$GITHUB_RUN_NUMBER"
+          ref=$(docker inspect --format '{{index .RepoDigests 0}}' "$OBRAZ:2.338.2-$GITHUB_RUN_NUMBER")
+          echo "image: $ref" | tee -a "$GITHUB_STEP_SUMMARY"
